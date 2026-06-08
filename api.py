@@ -36,6 +36,7 @@ import re
 import unicodedata
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from generator import generate_business_card_bytes
@@ -102,3 +103,35 @@ def generuj(data: VizitkaData, x_api_key: str = Header(default="")):
         "pocet_kusu": d["pocet_kusu"],
         "jmeno": d["jmeno"],
     }
+
+
+@app.post("/pdf")
+def generuj_pdf(data: VizitkaData, x_api_key: str = Header(default="")):
+    """Stejné jako /generuj, ale vrátí PDF přímo jako binární soubor.
+    Používá Make.com – příloha emailu bez nutnosti dekódovat base64."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Neplatný nebo chybějící API klíč.")
+
+    d = data.model_dump()
+    d["adresa"] = d["adresa"].replace(" | ", "\n").replace("|", "\n").strip()
+
+    chybi = [k for k in ["jmeno", "pozice", "telefon", "email", "adresa"]
+             if not (d.get(k) or "").strip()]
+    if chybi:
+        raise HTTPException(status_code=400,
+                            detail=f"Chybí povinná pole: {', '.join(chybi)}")
+
+    try:
+        pdf = generate_business_card_bytes(d)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chyba generování: {e}")
+
+    safe = _bez_diakritiky(d["jmeno"])
+    safe = re.sub(r"[^\w\s-]", "", safe)
+    safe = re.sub(r"\s+", "_", safe.strip())
+
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="vizitka_{safe}.pdf"'},
+    )
