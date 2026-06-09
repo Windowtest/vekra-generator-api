@@ -150,8 +150,38 @@ def pdf_na_png(pdf_bytes: bytes, scale: float = 3.0) -> bytes:
     return buf.getvalue()
 
 
+def wrap_adresa(adresa: str) -> str:
+    """Zalamí adresu na max 3 řádky.
+    Funguje pro formáty: newlines, svislítka, nebo čárkami oddělený jednořádkový string.
+    """
+    import re
+    if "\n" in adresa:
+        return adresa
+    adresa = adresa.replace(" | ", "\n")
+    if "\n" in adresa:
+        return adresa
+    # PSČ (XXX XX) automaticky na nový řádek
+    s_psz = re.sub(r',?\s*(\d{3}\s\d{2}\b)', r'\n\1', adresa)
+    if "\n" in s_psz:
+        radky = [r.strip() for r in s_psz.split('\n') if r.strip()]
+        if len(radky[0]) > 35:
+            casti = [c.strip() for c in radky[0].split(',')]
+            mid = max(1, len(casti) // 2)
+            radky = [', '.join(casti[:mid]), ', '.join(casti[mid:])] + radky[1:]
+        return '\n'.join(radky[:3])
+    # Rozděl na max 3 části po čárce
+    casti = [c.strip() for c in adresa.split(',')]
+    if len(casti) <= 3:
+        return '\n'.join(casti)
+    return '\n'.join([casti[0], ', '.join(casti[1:-1]), casti[-1]])
+
+
 def generate_business_card_bytes(data: dict) -> bytes:
     """Vyrobí PDF vizitku a vrátí ji jako bytes."""
+    # Zalamení adresy na max 3 řádky (pro různé formáty vstupu)
+    data = dict(data)
+    data["adresa"] = wrap_adresa(data.get("adresa", ""))
+
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
     c.setTitle(f"Vizitka VEKRA - {data['jmeno']}")
