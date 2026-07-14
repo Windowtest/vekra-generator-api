@@ -186,8 +186,8 @@ def generate_business_card_bytes(data: dict) -> bytes:
     c = canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
     c.setTitle(f"Vizitka VEKRA - {data['jmeno']}")
 
-    _draw_crop_marks(c)
     _draw_red_strip(c)
+    _draw_crop_marks(c)
 
     logo_x = BLEED + 18
     logo_h = 50
