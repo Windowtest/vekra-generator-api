@@ -220,10 +220,11 @@ def wrap_adresa(adresa: str) -> str:
     s_psz = re.sub(r',?\s*(\d{3}\s\d{2}\b)', r'\n\1', adresa)
     if "\n" in s_psz:
         radky = [r.strip() for r in s_psz.split('\n') if r.strip()]
-        if len(radky[0]) > 35:
-            casti = [c.strip() for c in radky[0].split(',')]
-            mid = max(1, len(casti) // 2)
-            radky = [', '.join(casti[:mid]), ', '.join(casti[mid:])] + radky[1:]
+        # Pokud první řádek (před PSČ) obsahuje čárku a ještě nemáme 3 řádky,
+        # rozděl ho na první čárce (typicky "Obchodní zastoupení, Ulice").
+        if len(radky) < 3 and ',' in radky[0]:
+            prvni, zbytek = radky[0].split(',', 1)
+            radky = [prvni.strip(), zbytek.strip()] + radky[1:]
         return '\n'.join(radky[:3])
     # Rozděl na max 3 části po čárce
     casti = [c.strip() for c in adresa.split(',')]
