@@ -36,6 +36,7 @@ import re
 import unicodedata
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -46,11 +47,18 @@ def _bez_diakritiky(s: str) -> str:
     nfd = unicodedata.normalize("NFD", s)
     return "".join(c for c in nfd if not unicodedata.combining(c))
 
-# Tajný klíč – nastaví se na Renderu jako proměnná prostředí API_KEY.
-# Když není nastaven, kontrola se přeskočí (jen pro lokální testování).
+
 API_KEY = os.environ.get("API_KEY", "")
 
 app = FastAPI(title="VEKRA – generátor vizitek", version="1.0")
+
+# CORS – povolí volání z prohlížeče (formulář otevřený lokálně i na webu)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 class VizitkaData(BaseModel):
@@ -105,31 +113,54 @@ def generuj(data: VizitkaData, x_api_key: str = Header(default="")):
     }
 
 
-@app.post("/pdf")
-def generuj_pdf(data: VizitkaData, x_api_key: str = Header(default="")):
-    """Stejné jako /generuj, ale vrátí PDF přímo jako binární soubor.
-    Používá Make.com – příloha emailu bez nutnosti dekódovat base64."""
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Neplatný nebo chybějící API klíč.")
+class VizitkaData(BaseModel):
+    jmeno: str
+    pozice: str
+    telefon: str
+    email: str
+    adresa: str
+    pocet_kusu: int = 0
 
+
+def _zpracuj(data: VizitkaData, api_key: str):
+    if API_KEY and api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Neplatný nebo chybějící API klíč.")
     d = data.model_dump()
     d["adresa"] = d["adresa"].replace(" | ", "\n").replace("|", "\n").strip()
-
     chybi = [k for k in ["jmeno", "pozice", "telefon", "email", "adresa"]
              if not (d.get(k) or "").strip()]
     if chybi:
         raise HTTPException(status_code=400,
                             detail=f"Chybí povinná pole: {', '.join(chybi)}")
-
     try:
-        pdf = generate_business_card_bytes(d)
+        return generate_business_card_bytes(d), d
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chyba generování: {e}")
 
-    safe = _bez_diakritiky(d["jmeno"])
-    safe = re.sub(r"[^\w\s-]", "", safe)
-    safe = re.sub(r"\s+", "_", safe.strip())
 
+@app.get("/")
+def health():
+    return {"status": "ok", "service": "VEKRA generátor vizitek"}
+
+
+@app.post("/generuj")
+def generuj(data: VizitkaData, x_api_key: str = Header(default="")):
+    """Vrátí JSON s PDF zakódovaným v base64 (pro Power Automate / Make.com)."""
+    pdf, d = _zpracuj(data, x_api_key)
+    safe = re.sub(r"\s+", "_", re.sub(r"[^\w\s-]", "", _bez_diakritiky(d["jmeno"])).strip())
+    return {
+        "filename": f"vizitka_{safe}.pdf",
+        "pdf_base64": base64.b64encode(pdf).decode("ascii"),
+        "pocet_kusu": d["pocet_kusu"],
+        "jmeno": d["jmeno"],
+    }
+
+
+@app.post("/pdf")
+def generuj_pdf(data: VizitkaData, x_api_key: str = Header(default="")):
+    """Vrátí PDF přímo jako binární soubor (pro Make.com přílohu a webový formulář)."""
+    pdf, d = _zpracuj(data, x_api_key)
+    safe = re.sub(r"\s+", "_", re.sub(r"[^\w\s-]", "", _bez_diakritiky(d["jmeno"])).strip())
     return Response(
         content=pdf,
         media_type="application/pdf",
