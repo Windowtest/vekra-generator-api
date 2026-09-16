@@ -1,11 +1,6 @@
 """
 VEKRA – API pro generování vizitek.
-
-Endpointy:
-    GET  /          – health check
-    POST /generuj   – vrátí JSON s PDF v base64 (Make.com / Power Automate)
-    POST /pdf       – vrátí PDF přímo jako soubor (webový formulář)
-
+Endpointy: GET / (health check), POST /generuj (JSON+base64), POST /pdf (binární PDF)
 Hlavička: X-API-Key: <klíč z Render Environment>
 """
 
