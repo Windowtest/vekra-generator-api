@@ -1,6 +1,11 @@
 """
 Generátor PDF vizitek VEKRA s QR kódem (vCard).
-Standalone verze pro lokální použití.
+
+Rozměry, barvy a rozmístění odpovídají tiskové předloze
+VEKRA_vizitky_lKiss_tisk.pdf (InDesign):
+  - čistý formát 90 x 50 mm, spad 3 mm, stránka 106,58 x 66,58 mm
+  - barvy v CMYK (červená C0 M100 Y71 K8, text K100)
+  - ořezové značky 0,25 pt na skutečných ořezových liniích
 """
 
 import io
@@ -10,7 +15,8 @@ import re
 from reportlab.graphics import renderPDF
 from reportlab.graphics.barcode.qr import QrCodeWidget
 from reportlab.graphics.shapes import Drawing
-from reportlab.lib.colors import HexColor, white
+from reportlab.lib.colors import CMYKColor
+from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
@@ -27,13 +33,60 @@ FONT_BOLD = os.path.join(FONTS_DIR, "Geograph-Bold.ttf")
 pdfmetrics.registerFont(TTFont("VekraSans", FONT_REGULAR))
 pdfmetrics.registerFont(TTFont("VekraSans-Bold", FONT_BOLD))
 
-PAGE_W = 302.126
-PAGE_H = 188.74
-BLEED = 8.5
+# --------------------------------------------------------------------------
+# Geometrie (naměřeno z předlohy)
+# --------------------------------------------------------------------------
+TRIM_W = 90 * mm            # čistý formát
+TRIM_H = 50 * mm
+BLEED = 3 * mm              # spad
+MARGIN = 8.29 * mm          # okraj stránky kolem čistého formátu
+PAGE_W = TRIM_W + 2 * MARGIN    # 302.126 pt
+PAGE_H = TRIM_H + 2 * MARGIN    # 188.74 pt
 
-VEKRA_RED = HexColor("#E30613")
-TEXT_BLACK = HexColor("#1A1A1A")
-TEXT_GRAY = HexColor("#333333")
+MARK_LEN = 5 * mm           # délka ořezové značky
+MARK_W = 0.25               # tloušťka ořezové značky v pt
+STRIP_W = 10 * mm           # červený pruh: 7 mm v čistém formátu + 3 mm spad
+
+# --------------------------------------------------------------------------
+# Barvy - CMYK jako v tiskové předloze
+# --------------------------------------------------------------------------
+VEKRA_RED = CMYKColor(0, 1, 0.71, 0.08)
+TEXT_BLACK = CMYKColor(0, 0, 0, 1)
+WHITE = CMYKColor(0, 0, 0, 0)
+
+
+def x_(mm_from_left):
+    """Vodorovná souřadnice: mm od levé ořezové linie -> body PDF."""
+    return MARGIN + mm_from_left * mm
+
+
+def y_(mm_from_top):
+    """Svislá souřadnice: mm od horní ořezové linie -> body PDF."""
+    return MARGIN + TRIM_H - mm_from_top * mm
+
+
+def format_phone(raw: str) -> str:
+    """Sjednotí telefon na tvar '+420 702 186 890'.
+
+    Přijme cokoliv: '702186890', '+420702186890', '00420 702 186 890'.
+    Co nerozpozná, vrátí beze změny.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if len(digits) == 9:                      # zadáno bez předvolby
+        digits = "420" + digits
+    if digits.startswith("420") and len(digits) == 12:
+        body = digits[3:]
+        return "+420 " + " ".join(body[i:i + 3] for i in range(0, 9, 3))
+    return (raw or "").strip()
+
+
+def _fit_size(text, font, size, max_w):
+    """Zmenší velikost písma, dokud se text nevejde do max_w."""
+    while size > 4 and pdfmetrics.stringWidth(text, font, size) > max_w:
+        size -= 0.25
+    return size
 
 
 def build_vcard(jmeno, pozice, telefon, email, adresa,
@@ -46,7 +99,7 @@ def build_vcard(jmeno, pozice, telefon, email, adresa,
     family = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
     title_str = " ".join(titles)
 
-    tel = re.sub(r"\s+", "", telefon)
+    tel = re.sub(r"\s+", "", format_phone(telefon))
     adr_oneline = re.sub(r"\s*\n\s*", ", ", adresa.strip())
 
     return (
@@ -89,28 +142,26 @@ def render_qr_png(vcard_text: str, size_px: int = 300) -> bytes:
 
 
 def _draw_crop_marks(c):
+    """Ořezové značky na skutečných ořezových liniích (90 x 50 mm).
+
+    Vedou od okraje stránky dovnitř, končí kousek před spadem - proto se
+    nikdy nekříží s červeným pruhem.
+    """
+    c.saveState()
     c.setStrokeColor(TEXT_BLACK)
-    c.setLineWidth(0.25)
-    GAP = 2
-    corners = [
-        (BLEED, BLEED),
-        (PAGE_W - BLEED, BLEED),
-        (BLEED, PAGE_H - BLEED),
-        (PAGE_W - BLEED, PAGE_H - BLEED),
-    ]
-    for (x, y) in corners:
-        if x == BLEED:
-            c.line(x - BLEED, y, x - GAP, y)
-        else:
-            c.line(x + GAP, y, x + BLEED, y)
-        if y == BLEED:
-            c.line(x, y - BLEED, x, y - GAP)
-        else:
-            c.line(x, y + GAP, x, y + BLEED)
+    c.setLineWidth(MARK_W)
+    for x in (MARGIN, MARGIN + TRIM_W):                 # svislé značky
+        c.line(x, 0, x, MARK_LEN)
+        c.line(x, PAGE_H, x, PAGE_H - MARK_LEN)
+    for y in (MARGIN, MARGIN + TRIM_H):                 # vodorovné značky
+        c.line(0, y, MARK_LEN, y)
+        c.line(PAGE_W, y, PAGE_W - MARK_LEN, y)
+    c.restoreState()
 
 
 def _draw_qr(c, vcard_text, x, y, size):
     qr = QrCodeWidget(vcard_text, barLevel="M")
+    qr.barBorder = 0          # bez vlastního okraje - klidová zóna je bílá plocha vizitky
     bounds = qr.getBounds()
     qr_w = bounds[2] - bounds[0]
     qr_h = bounds[3] - bounds[1]
@@ -120,18 +171,24 @@ def _draw_qr(c, vcard_text, x, y, size):
 
 
 def _draw_red_strip(c):
-    strip_w = 17
-    strip_x = PAGE_W - BLEED - strip_w
-    c.setFillColor(VEKRA_RED)
-    c.rect(strip_x, 0, strip_w + BLEED, PAGE_H, fill=1, stroke=0)
+    """Červený pruh vpravo - jen do spadu, ne přes celou stránku."""
     c.saveState()
-    c.setFillColor(white)
-    c.setFont("VekraSans-Bold", 8)
-    text_x = strip_x + strip_w / 2 + 3
-    text_y = PAGE_H / 2 - 28
-    c.translate(text_x, text_y)
+    c.setFillColor(VEKRA_RED)
+    c.rect(
+        MARGIN + TRIM_W + BLEED - STRIP_W,    # levá hrana pruhu
+        MARGIN - BLEED,                       # spodní hrana = spad
+        STRIP_W,
+        TRIM_H + 2 * BLEED,                   # výška = jen spad
+        fill=1, stroke=0,
+    )
+    # svislý nápis www.vekra.cz, čte se zdola nahoru, vystředěný na výšku
+    c.setFillColor(WHITE)
+    c.setFont("VekraSans-Bold", 12)
+    label = "www.vekra.cz"
+    label_w = pdfmetrics.stringWidth(label, "VekraSans-Bold", 12)
+    c.translate(x_(88.13), y_(25) - label_w / 2)
     c.rotate(90)
-    c.drawString(0, 0, "www.vekra.cz")
+    c.drawString(0, 0, label)
     c.restoreState()
 
 
@@ -154,7 +211,6 @@ def wrap_adresa(adresa: str) -> str:
     """Zalamí adresu na max 3 řádky.
     Funguje pro formáty: newlines, svislítka, nebo čárkami oddělený jednořádkový string.
     """
-    import re
     if "\n" in adresa:
         return adresa
     adresa = adresa.replace(" | ", "\n")
@@ -164,10 +220,11 @@ def wrap_adresa(adresa: str) -> str:
     s_psz = re.sub(r',?\s*(\d{3}\s\d{2}\b)', r'\n\1', adresa)
     if "\n" in s_psz:
         radky = [r.strip() for r in s_psz.split('\n') if r.strip()]
-        if len(radky[0]) > 35:
-            casti = [c.strip() for c in radky[0].split(',')]
-            mid = max(1, len(casti) // 2)
-            radky = [', '.join(casti[:mid]), ', '.join(casti[mid:])] + radky[1:]
+        # Pokud první řádek (před PSČ) obsahuje čárku a ještě nemáme 3 řádky,
+        # rozděl ho na první čárce (typicky "Obchodní zastoupení, Ulice").
+        if len(radky) < 3 and ',' in radky[0]:
+            prvni, zbytek = radky[0].split(',', 1)
+            radky = [prvni.strip(), zbytek.strip()] + radky[1:]
         return '\n'.join(radky[:3])
     # Rozděl na max 3 části po čárce
     casti = [c.strip() for c in adresa.split(',')]
@@ -178,9 +235,9 @@ def wrap_adresa(adresa: str) -> str:
 
 def generate_business_card_bytes(data: dict) -> bytes:
     """Vyrobí PDF vizitku a vrátí ji jako bytes."""
-    # Zalamení adresy na max 3 řádky (pro různé formáty vstupu)
     data = dict(data)
     data["adresa"] = wrap_adresa(data.get("adresa", ""))
+    telefon = format_phone(data.get("telefon", ""))
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
@@ -189,52 +246,53 @@ def generate_business_card_bytes(data: dict) -> bytes:
     _draw_red_strip(c)
     _draw_crop_marks(c)
 
-    logo_x = BLEED + 18
-    logo_h = 50
-    logo_w = logo_h * (759 / 241)
-    logo_y = PAGE_H - BLEED - logo_h - 17
-    c.drawImage(LOGO_PATH, logo_x, logo_y, width=logo_w, height=logo_h,
-                preserveAspectRatio=True, mask="auto")
+    # --- logo: šířka 29,7 mm, horní hrana 5,38 mm od ořezu -----------------
+    logo_w = 29.7 * mm
+    logo_h = logo_w * (241 / 759)
+    c.drawImage(LOGO_PATH, x_(5.16), y_(5.38) - logo_h,
+                width=logo_w, height=logo_h,
+                preserveAspectRatio=True, anchor="nw", mask="auto")
 
+    # --- QR kód: 17,9 mm, pravá hrana 77,51 mm od levého ořezu -------------
     vcard = build_vcard(
-        data["jmeno"], data["pozice"], data["telefon"],
+        data["jmeno"], data["pozice"], telefon,
         data["email"], data["adresa"]
     )
-    qr_size = 60
-    qr_x = PAGE_W - BLEED - 17 - qr_size - 14
-    qr_y = PAGE_H - BLEED - qr_size - 12
-    _draw_qr(c, vcard, qr_x, qr_y, qr_size)
+    qr_size = 17.9 * mm
+    _draw_qr(c, vcard, x_(77.51) - qr_size, y_(5.29) - qr_size, qr_size)
 
-    name_y = logo_y - 21
+    # --- jméno -------------------------------------------------------------
     c.setFillColor(TEXT_BLACK)
-    c.setFont("VekraSans-Bold", 11.5)
     parts = data["jmeno"].strip().split()
     formatted = " ".join(p if "." in p else p.upper() for p in parts)
-    c.drawString(logo_x, name_y, formatted)
+    size = _fit_size(formatted, "VekraSans-Bold", 12, 52 * mm)
+    c.setFont("VekraSans-Bold", size)
+    c.drawString(x_(5.44), y_(24.83), formatted)
 
-    c.setFont("VekraSans", 7.5)
-    c.setFillColor(TEXT_GRAY)
-    c.drawString(logo_x, name_y - 10, data["pozice"])
+    # --- pozice ------------------------------------------------------------
+    size = _fit_size(data["pozice"], "VekraSans", 7, 76 * mm)
+    c.setFont("VekraSans", size)
+    c.drawString(x_(5.25), y_(28.33), data["pozice"])
 
-    line_y = name_y - 25
+    # --- červená dělicí linka ---------------------------------------------
     c.setStrokeColor(VEKRA_RED)
-    c.setLineWidth(0.6)
-    c.line(logo_x, line_y, PAGE_W - BLEED - 17 - 6, line_y)
+    c.setLineWidth(0.96)                      # 0,34 mm
+    c.line(x_(5.2), y_(33.76), x_(82.5), y_(33.76))
 
-    col_y = line_y - 14
+    # --- levý sloupec: telefon, e-mail, web --------------------------------
     c.setFillColor(TEXT_BLACK)
-    c.setFont("VekraSans-Bold", 9)
-    c.drawString(logo_x, col_y, data["telefon"])
+    c.setFont("VekraSans-Bold", 9.5)
+    c.drawString(x_(5.33), y_(39.94), telefon)
     c.setFont("VekraSans", 7)
-    c.setFillColor(TEXT_GRAY)
-    c.drawString(logo_x, col_y - 10, data["email"])
-    c.drawString(logo_x, col_y - 20, "www.vekra.cz")
+    c.drawString(x_(5.42), y_(42.85), data["email"])
+    c.drawString(x_(5.25), y_(45.64), "www.vekra.cz")
 
+    # --- pravý sloupec: adresa (řádky zarovnané na levý sloupec) -----------
     addr_lines = [l.strip() for l in data["adresa"].split("\n") if l.strip()]
-    addr_x = logo_x + 130
-    c.setFont("VekraSans", 7)
-    for i, line in enumerate(addr_lines[:3]):
-        c.drawString(addr_x, col_y - i * 10, line)
+    for line, base in zip(addr_lines[:3], (40.01, 42.74, 45.57)):
+        size = _fit_size(line, "VekraSans", 7, 38 * mm)
+        c.setFont("VekraSans", size)
+        c.drawString(x_(43.72), y_(base), line)
 
     c.showPage()
     c.save()
