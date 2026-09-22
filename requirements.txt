@@ -1,4 +1,6 @@
-fastapi>=0.110
+fastapi[standard]>=0.110
 uvicorn[standard]>=0.29
 reportlab>=4.0
 Pillow>=10.0
+numpy>=1.24
+pikepdf>=8.0
