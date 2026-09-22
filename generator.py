@@ -12,19 +12,21 @@ import io
 import os
 import re
 
-from reportlab.graphics import renderPDF
 from reportlab.graphics.barcode.qr import QrCodeWidget
-from reportlab.graphics.shapes import Drawing
 from reportlab.lib.colors import CMYKColor
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 from PIL import Image, ImageDraw
+
+_LOGO_CACHE = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONTS_DIR = os.path.join(BASE_DIR, "fonts")
 LOGO_PATH = os.path.join(BASE_DIR, "vekra_logo.png")
+ICC_PATH = os.path.join(BASE_DIR, "icc", "FOGRA39L_coated.icc")
 
 # Geograph - oficiální firemní font VEKRA (převedený z OTF na TTF kvůli reportlabu)
 FONT_REGULAR = os.path.join(FONTS_DIR, "Geograph-Regular.ttf")
@@ -160,14 +162,31 @@ def _draw_crop_marks(c):
 
 
 def _draw_qr(c, vcard_text, x, y, size):
+    """QR kód vykreslený přímo jako černé (K100) obdélníky.
+
+    Nepoužívá renderPDF, který do PDF přidává nevložený font Times-Roman
+    (neprojde kontrolou PDF/X-1a). Sousední moduly v řádku se slévají
+    do jednoho obdélníku, aby PDF zůstalo malé.
+    """
     qr = QrCodeWidget(vcard_text, barLevel="M")
-    qr.barBorder = 0          # bez vlastního okraje - klidová zóna je bílá plocha vizitky
-    bounds = qr.getBounds()
-    qr_w = bounds[2] - bounds[0]
-    qr_h = bounds[3] - bounds[1]
-    d = Drawing(size, size, transform=[size / qr_w, 0, 0, size / qr_h, 0, 0])
-    d.add(qr)
-    renderPDF.draw(d, c, x, y)
+    qr.draw()                                # inicializuje matici
+    modules = qr.qr.modules
+    n = qr.qr.moduleCount
+    m = size / n                             # velikost jednoho modulu
+    c.saveState()
+    c.setFillColor(TEXT_BLACK)
+    for r in range(n):
+        col = 0
+        while col < n:
+            if modules[r][col]:
+                s = col
+                while col < n and modules[r][col]:
+                    col += 1
+                c.rect(x + s * m, y + size - (r + 1) * m,
+                       (col - s) * m, m, fill=1, stroke=0)
+            else:
+                col += 1
+    c.restoreState()
 
 
 def _draw_red_strip(c):
@@ -233,6 +252,68 @@ def wrap_adresa(adresa: str) -> str:
     return '\n'.join([casti[0], ', '.join(casti[1:-1]), casti[-1]])
 
 
+def _logo_cmyk():
+    """Načte logo a převede ho na CMYK s přesnými tiskovými barvami.
+
+    Logo obsahuje jen tři barvy (bílá, černá, firemní červená), takže je
+    namapujeme přímo na CMYK hodnoty z tiskové předlohy. Výsledek se do PDF
+    vloží bezeztrátově – žádné JPEG artefakty na hranách.
+
+    Výsledek se cachuje, aby se převod nedělal u každé vizitky znovu.
+    """
+    global _LOGO_CACHE
+    if _LOGO_CACHE is not None:
+        return _LOGO_CACHE
+
+    import numpy as np
+    rgb = np.array(Image.open(LOGO_PATH).convert("RGB")).astype(np.int16)
+    r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+
+    je_bila = (r > 200) & (g > 200) & (b > 200)
+    je_cervena = (r > 120) & (g < 120) & (b < 120)
+    je_cerna = ~je_bila & ~je_cervena
+
+    h, w = rgb.shape[:2]
+    cmyk = np.zeros((h, w, 4), dtype=np.uint8)
+    cmyk[je_cervena] = [0, 255, 181, 20]   # C0 M100 Y71 K8
+    cmyk[je_cerna] = [0, 0, 0, 255]        # K100
+
+    _LOGO_CACHE = ImageReader(Image.fromarray(cmyk, mode="CMYK"))
+    return _LOGO_CACHE
+
+
+def _na_pdfx(pdf_bytes: bytes, title: str) -> bytes:
+    """Doplní do PDF náležitosti standardu PDF/X-1a:2003 pro tiskárnu:
+      - výstupní záměr (OutputIntent) s tiskovým profilem FOGRA39 Coated,
+      - klíč verze GTS_PDFXVersion a Trapped v informacích dokumentu.
+    TrimBox/BleedBox a CMYK barvy nastavuje už samotné generování.
+    """
+    import pikepdf
+    pdf = pikepdf.open(io.BytesIO(pdf_bytes))
+
+    with open(ICC_PATH, "rb") as f:
+        icc = pikepdf.Stream(pdf, f.read())
+    icc.N = 4                                # CMYK profil = 4 kanály
+
+    pdf.Root.OutputIntents = pikepdf.Array([pikepdf.Dictionary(
+        Type=pikepdf.Name.OutputIntent,
+        S=pikepdf.Name.GTS_PDFX,
+        OutputConditionIdentifier="FOGRA39",
+        OutputCondition="Coated FOGRA39 (ISO 12647-2:2004)",
+        Info="Coated FOGRA39 (ISO 12647-2:2004)",
+        RegistryName="http://www.color.org",
+        DestOutputProfile=icc,
+    )])
+
+    pdf.docinfo["/Title"] = title
+    pdf.docinfo["/GTS_PDFXVersion"] = "PDF/X-1a:2003"
+    pdf.docinfo["/Trapped"] = pikepdf.Name("/False")
+
+    out = io.BytesIO()
+    pdf.save(out, force_version="1.4")
+    return out.getvalue()
+
+
 def generate_business_card_bytes(data: dict) -> bytes:
     """Vyrobí PDF vizitku a vrátí ji jako bytes."""
     data = dict(data)
@@ -240,7 +321,19 @@ def generate_business_card_bytes(data: dict) -> bytes:
     telefon = format_phone(data.get("telefon", ""))
 
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=(PAGE_W, PAGE_H))
+    c = canvas.Canvas(
+        buf,
+        pagesize=(PAGE_W, PAGE_H),
+        # Ořezové rámečky pro tiskárnu:
+        #   TrimBox  = čistý formát 90 x 50 mm (kde se řeže)
+        #   BleedBox = čistý formát + 3 mm spad
+        trimBox=(MARGIN, MARGIN, MARGIN + TRIM_W, MARGIN + TRIM_H),
+        bleedBox=(MARGIN - BLEED, MARGIN - BLEED,
+                  MARGIN + TRIM_W + BLEED, MARGIN + TRIM_H + BLEED),
+        # Vynutí CMYK u všech barev – žádné RGB v tiskovém PDF
+        enforceColorSpace="cmyk",
+        initialFontName="VekraSans",
+    )
     c.setTitle(f"Vizitka VEKRA - {data['jmeno']}")
 
     _draw_red_strip(c)
@@ -249,7 +342,7 @@ def generate_business_card_bytes(data: dict) -> bytes:
     # --- logo: šířka 29,7 mm, horní hrana 5,38 mm od ořezu -----------------
     logo_w = 29.7 * mm
     logo_h = logo_w * (241 / 759)
-    c.drawImage(LOGO_PATH, x_(5.16), y_(5.38) - logo_h,
+    c.drawImage(_logo_cmyk(), x_(5.16), y_(5.38) - logo_h,
                 width=logo_w, height=logo_h,
                 preserveAspectRatio=True, anchor="nw", mask="auto")
 
@@ -267,18 +360,17 @@ def generate_business_card_bytes(data: dict) -> bytes:
     formatted = " ".join(p if "." in p else p.upper() for p in parts)
     size = _fit_size(formatted, "VekraSans-Bold", 12, 52 * mm)
     c.setFont("VekraSans-Bold", size)
-    c.drawString(x_(5.44), y_(24.83), formatted)
+    c.drawString(x_(5.25), y_(24.83), formatted)
 
     # --- pozice ------------------------------------------------------------
     size = _fit_size(data["pozice"], "VekraSans", 7, 76 * mm)
     c.setFont("VekraSans", size)
     c.drawString(x_(5.25), y_(28.33), data["pozice"])
 
-    # --- červená dělicí linka (táhne se až k levé hraně červeného pruhu) ---
-    strip_start_mm = (TRIM_W + BLEED - STRIP_W) / mm   # = 83 mm
+    # --- červená dělicí linka ---------------------------------------------
     c.setStrokeColor(VEKRA_RED)
     c.setLineWidth(0.96)                      # 0,34 mm
-    c.line(x_(5.2), y_(33.76), x_(strip_start_mm), y_(33.76))
+    c.line(x_(5.2), y_(33.76), x_(82.5), y_(33.76))
 
     # --- levý sloupec: telefon, e-mail, web --------------------------------
     c.setFillColor(TEXT_BLACK)
@@ -297,4 +389,4 @@ def generate_business_card_bytes(data: dict) -> bytes:
 
     c.showPage()
     c.save()
-    return buf.getvalue()
+    return _na_pdfx(buf.getvalue(), f"Vizitka VEKRA - {data['jmeno']}")
