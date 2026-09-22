@@ -368,9 +368,13 @@ def generate_business_card_bytes(data: dict) -> bytes:
     c.drawString(x_(5.25), y_(28.33), data["pozice"])
 
     # --- červená dělicí linka ---------------------------------------------
+    # Končí 1 mm UVNITŘ červeného boxu vpravo (box začíná na 83 mm od ořezu),
+    # takže mezi čárou a boxem nikdy nevznikne mezera. Čára i box mají
+    # stejnou barvu, takže přesah není vidět.
+    strip_start_mm = (TRIM_W + BLEED - STRIP_W) / mm   # = 83 mm
     c.setStrokeColor(VEKRA_RED)
     c.setLineWidth(0.96)                      # 0,34 mm
-    c.line(x_(5.2), y_(33.76), x_(82.5), y_(33.76))
+    c.line(x_(5.2), y_(33.76), x_(strip_start_mm + 1), y_(33.76))
 
     # --- levý sloupec: telefon, e-mail, web --------------------------------
     c.setFillColor(TEXT_BLACK)
