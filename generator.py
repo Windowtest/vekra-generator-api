@@ -18,14 +18,11 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
 from PIL import Image, ImageDraw
-
-_LOGO_CACHE = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FONTS_DIR = os.path.join(BASE_DIR, "fonts")
-LOGO_PATH = os.path.join(BASE_DIR, "vekra_logo.png")
+LOGO_PATH = os.path.join(BASE_DIR, "vekra_logo.pdf")   # vektorové logo v křivkách
 ICC_PATH = os.path.join(BASE_DIR, "icc", "FOGRA39L_coated.icc")
 
 # Geograph - oficiální firemní font VEKRA (převedený z OTF na TTF kvůli reportlabu)
@@ -48,6 +45,11 @@ PAGE_H = TRIM_H + 2 * MARGIN    # 188.74 pt
 MARK_LEN = 5 * mm           # délka ořezové značky
 MARK_W = 0.25               # tloušťka ořezové značky v pt
 STRIP_W = 10 * mm           # červený pruh: 7 mm v čistém formátu + 3 mm spad
+
+# Logo: šířka 29,7 mm, levá hrana 5,16 mm a horní hrana 5,38 mm od ořezu
+LOGO_W = 29.7 * mm
+LOGO_X_MM = 5.16
+LOGO_TOP_MM = 5.38
 
 # --------------------------------------------------------------------------
 # Barvy - CMYK jako v tiskové předloze
@@ -252,34 +254,116 @@ def wrap_adresa(adresa: str) -> str:
     return '\n'.join([casti[0], ', '.join(casti[1:-1]), casti[-1]])
 
 
-def _logo_cmyk():
-    """Načte logo a převede ho na CMYK s přesnými tiskovými barvami.
+_LOGO_BBOX_CACHE = None
 
-    Logo obsahuje jen tři barvy (bílá, černá, firemní červená), takže je
-    namapujeme přímo na CMYK hodnoty z tiskové předlohy. Výsledek se do PDF
-    vloží bezeztrátově – žádné JPEG artefakty na hranách.
 
-    Výsledek se cachuje, aby se převod nedělal u každé vizitky znovu.
+def _logo_bbox():
+    """Zjistí rozsah samotné kresby uvnitř PDF s logem.
+
+    Logo je uložené na velké stránce s bílým okolím; potřebujeme vědět, kde
+    kresba doopravdy začíná a končí, aby šla do vizitky umístit přesně.
+    Spočítá se z vykreslovacích operátorů a výsledek se cachuje.
     """
-    global _LOGO_CACHE
-    if _LOGO_CACHE is not None:
-        return _LOGO_CACHE
+    global _LOGO_BBOX_CACHE
+    if _LOGO_BBOX_CACHE is not None:
+        return _LOGO_BBOX_CACHE
 
-    import numpy as np
-    rgb = np.array(Image.open(LOGO_PATH).convert("RGB")).astype(np.int16)
-    r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    import pikepdf
 
-    je_bila = (r > 200) & (g > 200) & (b > 200)
-    je_cervena = (r > 120) & (g < 120) & (b < 120)
-    je_cerna = ~je_bila & ~je_cervena
+    with pikepdf.open(LOGO_PATH) as doc:
+        page = doc.pages[0]
+        obsah = page.Contents
+        data = b"".join(
+            s.read_bytes() for s in
+            (obsah if isinstance(obsah, pikepdf.Array) else [obsah])
+        ).decode("latin-1")
 
-    h, w = rgb.shape[:2]
-    cmyk = np.zeros((h, w, 4), dtype=np.uint8)
-    cmyk[je_cervena] = [0, 255, 181, 20]   # C0 M100 Y71 K8
-    cmyk[je_cerna] = [0, 0, 0, 255]        # K100
+    def nasob(m1, m2):
+        a1, b1, c1, d1, e1, f1 = m1
+        a2, b2, c2, d2, e2, f2 = m2
+        return (a1 * a2 + b1 * c2, a1 * b2 + b1 * d2,
+                c1 * a2 + d1 * c2, c1 * b2 + d1 * d2,
+                e1 * a2 + f1 * c2 + e2, e1 * b2 + f1 * d2 + f2)
 
-    _LOGO_CACHE = ImageReader(Image.fromarray(cmyk, mode="CMYK"))
-    return _LOGO_CACHE
+    def bod(m, x, y):
+        a, b, c, d, e, f = m
+        return (a * x + c * y + e, b * x + d * y + f)
+
+    xs, ys = [], []
+    ctm = (1, 0, 0, 1, 0, 0)
+    zasobnik, cisla = [], []
+
+    for token in data.split():
+        if re.fullmatch(r"-?\d*\.?\d+", token):
+            cisla.append(float(token))
+            continue
+        if token == "cm" and len(cisla) >= 6:
+            ctm = nasob(tuple(cisla[-6:]), ctm)
+        elif token == "q":
+            zasobnik.append(ctm)
+        elif token == "Q" and zasobnik:
+            ctm = zasobnik.pop()
+        elif token in ("m", "l") and len(cisla) >= 2:
+            xy = bod(ctm, cisla[-2], cisla[-1])
+            xs.append(xy[0]); ys.append(xy[1])
+        elif token == "c" and len(cisla) >= 6:
+            for i in (0, 2, 4):
+                xy = bod(ctm, cisla[-6 + i], cisla[-5 + i])
+                xs.append(xy[0]); ys.append(xy[1])
+        elif token == "re" and len(cisla) >= 4:
+            rx, ry, rw, rh = cisla[-4:]
+            # obdélník přes celou stránku je ořezová oblast, ne kresba
+            if not (rw > 500 and rh > 400):
+                for px, py in ((rx, ry), (rx + rw, ry),
+                               (rx, ry + rh), (rx + rw, ry + rh)):
+                    xy = bod(ctm, px, py)
+                    xs.append(xy[0]); ys.append(xy[1])
+        cisla = []
+
+    if not xs:
+        raise RuntimeError("V logu se nepodařilo najít žádnou kresbu.")
+
+    _LOGO_BBOX_CACHE = (min(xs), min(ys), max(xs), max(ys))
+    return _LOGO_BBOX_CACHE
+
+
+def _vloz_vektorove_logo(pdf_bytes: bytes) -> bytes:
+    """Vloží firemní logo jako VEKTOR (křivky) místo bitmapy.
+
+    Logo je samostatné PDF v křivkách a v CMYK. Vezmeme z něj stránku jako
+    Form XObject, spočítáme měřítko podle skutečného rozsahu kresby a umístíme
+    ho do vizitky. Tiskárna tak dostane ostrou vektorovou kresbu, ne rastr.
+    """
+    import pikepdf
+
+    pdf = pikepdf.open(io.BytesIO(pdf_bytes))
+    logo_pdf = pikepdf.open(LOGO_PATH)
+
+    xobj = pdf.copy_foreign(pikepdf.Page(logo_pdf.pages[0]).as_form_xobject())
+
+    # Rozsah samotné kresby uvnitř stránky loga (bez okolní bílé plochy)
+    x0, y0, x1, y1 = _logo_bbox()
+    scale = LOGO_W / (x1 - x0)
+
+    page = pdf.pages[0]
+    if "/Resources" not in page:
+        page.Resources = pikepdf.Dictionary()
+    if "/XObject" not in page.Resources:
+        page.Resources.XObject = pikepdf.Dictionary()
+    page.Resources.XObject["/VekraLogo"] = xobj
+
+    # Posun tak, aby levá hrana kresby byla na LOGO_X_MM
+    # a horní hrana na LOGO_TOP_MM od ořezu.
+    tx = x_(LOGO_X_MM) - scale * x0
+    ty = y_(LOGO_TOP_MM) - scale * y1
+    vlozeni = (f"\nq {scale:.6f} 0 0 {scale:.6f} {tx:.4f} {ty:.4f} cm "
+               f"/VekraLogo Do Q\n").encode("ascii")
+
+    page.contents_add(pikepdf.Stream(pdf, vlozeni), prepend=False)
+
+    out = io.BytesIO()
+    pdf.save(out)
+    return out.getvalue()
 
 
 def _na_pdfx(pdf_bytes: bytes, title: str) -> bytes:
@@ -339,12 +423,7 @@ def generate_business_card_bytes(data: dict) -> bytes:
     _draw_red_strip(c)
     _draw_crop_marks(c)
 
-    # --- logo: šířka 29,7 mm, horní hrana 5,38 mm od ořezu -----------------
-    logo_w = 29.7 * mm
-    logo_h = logo_w * (241 / 759)
-    c.drawImage(_logo_cmyk(), x_(5.16), y_(5.38) - logo_h,
-                width=logo_w, height=logo_h,
-                preserveAspectRatio=True, anchor="nw", mask="auto")
+    # --- logo se vkládá jako vektor až po uložení (viz _vloz_vektorove_logo) ---
 
     # --- QR kód: 17,9 mm, pravá hrana 77,51 mm od levého ořezu -------------
     vcard = build_vcard(
@@ -368,13 +447,9 @@ def generate_business_card_bytes(data: dict) -> bytes:
     c.drawString(x_(5.25), y_(28.33), data["pozice"])
 
     # --- červená dělicí linka ---------------------------------------------
-    # Končí 1 mm UVNITŘ červeného boxu vpravo (box začíná na 83 mm od ořezu),
-    # takže mezi čárou a boxem nikdy nevznikne mezera. Čára i box mají
-    # stejnou barvu, takže přesah není vidět.
-    strip_start_mm = (TRIM_W + BLEED - STRIP_W) / mm   # = 83 mm
     c.setStrokeColor(VEKRA_RED)
     c.setLineWidth(0.96)                      # 0,34 mm
-    c.line(x_(5.2), y_(33.76), x_(strip_start_mm + 1), y_(33.76))
+    c.line(x_(5.2), y_(33.76), x_(84), y_(33.76))
 
     # --- levý sloupec: telefon, e-mail, web --------------------------------
     c.setFillColor(TEXT_BLACK)
@@ -393,4 +468,5 @@ def generate_business_card_bytes(data: dict) -> bytes:
 
     c.showPage()
     c.save()
-    return _na_pdfx(buf.getvalue(), f"Vizitka VEKRA - {data['jmeno']}")
+    s_logem = _vloz_vektorove_logo(buf.getvalue())
+    return _na_pdfx(s_logem, f"Vizitka VEKRA - {data['jmeno']}")
